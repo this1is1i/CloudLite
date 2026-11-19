@@ -1,0 +1,6 @@
+/target/
+/data/
+/portable/data/
+/portable/*.exe
+/.build-cache/
+*.log

@@ -1,0 +1,287 @@
+use crate::model::Track;
+use anyhow::{ensure, Context};
+use ncm_api_rs::{ApiClient, ApiResponse, Query};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+pub fn merge_cookies(current: &mut BTreeMap<String, String>, set_cookies: &[String]) {
+    for raw in set_cookies {
+        if let Some((key, value)) = raw.split(';').next().unwrap_or("").split_once('=') {
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            if value.is_empty()
+                || raw
+                    .split(';')
+                    .any(|a| a.trim().eq_ignore_ascii_case("Max-Age=0"))
+            {
+                current.remove(key);
+            } else {
+                current.insert(key.into(), value.trim().into());
+            }
+        }
+    }
+}
+pub fn playlist_ids(body: &Value) -> anyhow::Result<Vec<u64>> {
+    let playlist = &body["playlist"];
+    let ids = playlist["trackIds"]
+        .as_array()
+        .context("歌单未返回完整曲目 ID，请重试")?
+        .iter()
+        .filter_map(|s| s["id"].as_u64())
+        .collect::<Vec<_>>();
+    let count = playlist["trackCount"].as_u64().unwrap_or(ids.len() as u64);
+    ensure!(
+        ids.len() as u64 >= count,
+        "歌单只返回了 {}/{} 个曲目 ID，已停止加载以避免遗漏",
+        ids.len(),
+        count
+    );
+    Ok(ids)
+}
+pub fn order_tracks(ids: &[u64], tracks: Vec<Track>) -> Vec<Track> {
+    let mut tracks = tracks
+        .into_iter()
+        .filter_map(|s| s.id.map(|id| (id, s)))
+        .collect::<BTreeMap<_, _>>();
+    ids.iter().filter_map(|id| tracks.remove(id)).collect()
+}
+pub fn playback_url(body: &Value) -> anyhow::Result<(String, bool)> {
+    let item = &body["data"][0];
+    let value = item["url"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .context("此歌曲暂无可播放音源，或超出账号权益")?;
+    let mut url = url::Url::parse(value)?;
+    ensure!(
+        ["http", "https"].contains(&url.scheme()),
+        "平台返回了非网络播放地址"
+    );
+    if url.scheme() == "http" {
+        url.set_scheme("https")
+            .map_err(|_| anyhow::anyhow!("无效的音源地址"))?;
+    }
+    Ok((url.to_string(), !item["freeTrialInfo"].is_null()))
+}
+
+#[derive(Debug, Clone)]
+pub struct Playlist {
+    pub id: u64,
+    pub name: String,
+    pub count: u64,
+}
+
+pub struct CloudClient {
+    client: ApiClient,
+    cookies: BTreeMap<String, String>,
+    session: PathBuf,
+    logged_in: bool,
+}
+impl CloudClient {
+    pub fn new(data: &Path, device_id: &str) -> Self {
+        let session = data.join("session.dpapi");
+        let cookies = std::fs::read(&session)
+            .ok()
+            .and_then(|bytes| crate::credentials::unprotect(&bytes).ok())
+            .and_then(|bytes| serde_json::from_slice::<BTreeMap<String, String>>(&bytes).ok())
+            .unwrap_or_default();
+        Self::with_cookies(session, device_id, cookies)
+    }
+    pub fn sign_in(data: &Path, device_id: &str) -> Self {
+        Self::with_cookies(data.join("session.dpapi"), device_id, BTreeMap::new())
+    }
+    fn with_cookies(session: PathBuf, device_id: &str, cookies: BTreeMap<String, String>) -> Self {
+        let cookie = cookies
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut client = ncm_api_rs::create_client(Some(cookie));
+        client.set_device_id(device_id.into());
+        Self {
+            client,
+            cookies,
+            session,
+            logged_in: false,
+        }
+    }
+    pub fn has_session(&self) -> bool {
+        self.cookies.contains_key("MUSIC_U")
+    }
+    fn accept(&mut self, response: ApiResponse) -> anyhow::Result<Value> {
+        let before = self.cookies.clone();
+        merge_cookies(&mut self.cookies, &response.cookie);
+        if before != self.cookies {
+            self.client.set_cookie(
+                self.cookies
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
+            if self.logged_in {
+                self.save_session()?;
+            }
+        }
+        Ok(response.body)
+    }
+    fn save_session(&self) -> anyhow::Result<()> {
+        crate::persistence::save_bytes(
+            &self.session,
+            &crate::credentials::protect(&serde_json::to_vec(&self.cookies)?)?,
+        )
+    }
+    pub fn commit_session(&self) -> anyhow::Result<()> {
+        self.save_session()
+    }
+    pub fn logout(&mut self) -> anyhow::Result<()> {
+        // Revoke only this local session; do not send account-wide logout to the platform.
+        self.cookies.clear();
+        self.client.set_cookie(String::new());
+        self.logged_in = false;
+        crate::persistence::save_bytes(&self.session, &crate::credentials::protect(b"{}")?)
+    }
+    pub async fn account(&mut self) -> anyhow::Result<Option<(u64, String)>> {
+        let response = tokio::time::timeout(
+            Duration::from_secs(18),
+            self.client.user_account(&Query::new()),
+        )
+        .await??;
+        let body = self.accept(response)?;
+        let profile = body.get("profile").or_else(|| body["data"].get("profile"));
+        if let Some(profile) = profile {
+            if let Some(id) = profile["userId"].as_u64() {
+                self.logged_in = true;
+                return Ok(Some((
+                    id,
+                    profile["nickname"].as_str().unwrap_or("网易云用户").into(),
+                )));
+            }
+        }
+        self.logged_in = false;
+        Ok(None)
+    }
+    pub async fn qr_key(&mut self) -> anyhow::Result<String> {
+        let response = tokio::time::timeout(
+            Duration::from_secs(18),
+            self.client.login_qr_key(&Query::new()),
+        )
+        .await??;
+        let body = self.accept(response)?;
+        body["unikey"]
+            .as_str()
+            .or_else(|| body["data"]["unikey"].as_str())
+            .map(str::to_string)
+            .context("平台未返回登录二维码")
+    }
+    pub async fn qr_check(&mut self, key: &str) -> anyhow::Result<u64> {
+        let response = tokio::time::timeout(
+            Duration::from_secs(12),
+            self.client.login_qr_check(&Query::new().param("key", key)),
+        )
+        .await??;
+        let body = self.accept(response)?;
+        Ok(body["code"].as_u64().unwrap_or(800))
+    }
+    pub async fn search(
+        &mut self,
+        keywords: &str,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<Track>, usize)> {
+        let query = Query::new()
+            .param("keywords", keywords)
+            .param("type", "1")
+            .param("limit", "100")
+            .param("offset", &offset.to_string());
+        let response =
+            tokio::time::timeout(Duration::from_secs(18), self.client.cloudsearch(&query))
+                .await??;
+        let body = self.accept(response)?;
+        ensure!(
+            body["result"]["songs"].is_array() || body["result"]["songCount"].as_u64() == Some(0),
+            "搜索响应异常"
+        );
+        Ok((
+            crate::model::parse_tracks(&body["result"]["songs"]),
+            body["result"]["songCount"].as_u64().unwrap_or(0) as usize,
+        ))
+    }
+    pub async fn playlists(&mut self, user: u64) -> anyhow::Result<Vec<Playlist>> {
+        let mut all = Vec::new();
+        let mut offset = 0;
+        loop {
+            let query = Query::new()
+                .param("uid", &user.to_string())
+                .param("limit", "200")
+                .param("offset", &offset.to_string());
+            let response =
+                tokio::time::timeout(Duration::from_secs(18), self.client.user_playlist(&query))
+                    .await??;
+            let body = self.accept(response)?;
+            let list = body["playlist"].as_array().context("平台未返回歌单列表")?;
+            all.extend(list.iter().filter_map(|p| {
+                Some(Playlist {
+                    id: p["id"].as_u64()?,
+                    name: p["name"].as_str().unwrap_or("歌单").into(),
+                    count: p["trackCount"].as_u64().unwrap_or(0),
+                })
+            }));
+            if !body["more"].as_bool().unwrap_or(false) || list.is_empty() {
+                break;
+            }
+            offset += list.len();
+            ensure!(offset < 100000, "歌单数量超过安全上限");
+        }
+        Ok(all)
+    }
+    pub async fn playlist(&mut self, id: u64) -> anyhow::Result<Vec<Track>> {
+        let response = tokio::time::timeout(
+            Duration::from_secs(18),
+            self.client
+                .playlist_detail(&Query::new().param("id", &id.to_string()).param("s", "0")),
+        )
+        .await??;
+        let body = self.accept(response)?;
+        let ids = playlist_ids(&body)?;
+        let mut tracks = Vec::with_capacity(ids.len());
+        // The embedded tracks field may contain only the first 10/1000 tracks.
+        for chunk in ids.chunks(200) {
+            let query = Query::new().param(
+                "ids",
+                &chunk
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            let response =
+                tokio::time::timeout(Duration::from_secs(18), self.client.song_detail(&query))
+                    .await??;
+            let body = self.accept(response)?;
+            tracks.extend(crate::model::parse_tracks(&body["songs"]));
+        }
+        let ordered = order_tracks(&ids, tracks);
+        ensure!(
+            ordered.len() == ids.len(),
+            "歌单详情不完整：取得 {}/{} 首，请重试",
+            ordered.len(),
+            ids.len()
+        );
+        Ok(ordered)
+    }
+    pub async fn song_url(&mut self, id: u64) -> anyhow::Result<(String, bool)> {
+        let query = Query::new()
+            .param("id", &id.to_string())
+            .param("level", "exhigh");
+        let response =
+            tokio::time::timeout(Duration::from_secs(18), self.client.song_url_v1(&query))
+                .await??;
+        let body = self.accept(response)?;
+        playback_url(&body)
+    }
+}
