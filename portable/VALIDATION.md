@@ -1,5 +1,16 @@
 # 验收记录
 
+## 在线播放取址修复（2026-11-19）
+
+- 现象：登录后播放任意在线歌曲都会失败，状态栏显示「播放失败：获取播放地址失败: Invalid parameter: Unknown error」。
+- 根因：新版接口 `/eapi/song/enhance/player/url/v1` 返回 HTTP 200，但响应体是 `{"code":-460,"message":"检测到您的网络环境存在风险，请稍后再试"}`。平台侧风控（-460）被 SDK 折叠成 400，且 SDK 只读 `msg` 字段（该响应用的是 `message`），于是错误文本退化成 "Unknown error"。同一台机器上兼容接口 `/api/song/enhance/player/url` 一直正常返回可用地址。
+- 修复：`cloud.rs` 的 `song_url` 改为先用兼容接口（`id` + `br=999000`，按账号权限取最高码率），它返回空地址或请求失败时再试新版接口；兼容接口已返回「无音源」这类答案时，最终提示仍是「此歌曲暂无可播放音源，或超出账号权益」，不拿风控文案覆盖它。
+- 同步修正 SDK：错误信息同时读取 `msg` 与 `message`；负数业务码（风控/拦截）归入限流类错误，不再显示成「参数错误」。
+- 匿名实测（2026-11-19）：歌曲 1974443814、347230 经新的取址路径返回 `https://…music.126.net/…mp3`，试听标记 `preview=true`；无音源的 186016 返回「此歌曲暂无可播放音源，或超出账号权益」并附新版接口的风控说明。
+- 本次 `cargo test --offline --locked --tests` 23 项通过，`cargo fmt --check` 通过，Release 构建通过；可执行文件 3,608,576 字节。
+- 此前「图标、扫描进度与网络重试」一节记录的 `--probe-api` 项 `public_playback_url_received=true` 不可信：同一取址路径在当时会返回 -460，该项应视为历史记录。
+- 真实登录账号下的会员/无损曲目取址尚未人工复测。
+
 ## 图标、扫描进度与网络重试（2026-11-19）
 
 - 可执行文件此前没有图标：图标资源 `assets/cloudlite.ico`（6 个尺寸）一直没有被编译进去。现在 `build.rs` 会定位 Windows SDK 的 `rc.exe`（先查 PATH，再查 Windows Kits 的 `x64` 目录，取版本号最大者），把 `1 ICON` 资源编译成 `cloudlite.res` 并作为链接参数交给链接器；找不到 `rc.exe` 时只打印警告，构建仍然成功。窗口类改用 `LoadImageW` 读取该资源，`WM_SETICON` 同时设置小图标与大图标，任务栏和 Alt+Tab 都显示新图标。

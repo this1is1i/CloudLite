@@ -327,7 +327,36 @@ impl CloudClient {
         );
         Ok(ordered)
     }
+    /// The EAPI player endpoint answers `code = -460` ("检测到您的网络环境存在风险")
+    /// from many home networks, so the plain `/api/song/enhance/player/url` endpoint is
+    /// asked first: it keeps answering, and `br = 999000` still asks for the best
+    /// bitrate the account may stream. The EAPI endpoint stays as a second chance for
+    /// songs the plain endpoint cannot resolve.
     pub async fn song_url(&mut self, id: u64) -> anyhow::Result<(String, bool)> {
+        let plain = Query::new()
+            .param("id", &id.to_string())
+            .param("br", "999000");
+        let plain = send!(
+            "获取播放地址",
+            tokio::time::timeout(Duration::from_secs(18), self.client.song_url(&plain))
+        );
+        match plain {
+            Ok(response) => {
+                let body = self.accept(response)?;
+                match playback_url(&body) {
+                    Ok(play) => Ok(play),
+                    // No audio is an answer, not a failure: try the other endpoint but
+                    // keep "no source for this account" when that one fails too.
+                    Err(no_source) => self.song_url_modern(id).await.or(Err(no_source)),
+                }
+            }
+            Err(plain) => match self.song_url_modern(id).await {
+                Ok(play) => Ok(play),
+                Err(modern) => Err(anyhow::anyhow!("{plain:#}\n新版接口同样失败：{modern:#}")),
+            },
+        }
+    }
+    async fn song_url_modern(&mut self, id: u64) -> anyhow::Result<(String, bool)> {
         let query = Query::new()
             .param("id", &id.to_string())
             .param("level", "exhigh");

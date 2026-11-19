@@ -478,6 +478,10 @@ impl ApiClient {
             })
             .unwrap_or(status_code);
 
+        // 平台返回的原始业务码：负数（如 -460 风控）在下面会被折叠成 400，
+        // 保留一份用于给出准确的错误类型。
+        let api_code = status;
+
         // 特殊状态码视为 200
         if SPECIAL_STATUS_CODES.contains(&status) {
             status = 200;
@@ -497,13 +501,20 @@ impl ApiClient {
         if status == 200 {
             Ok(answer)
         } else {
+            // 平台有的接口用 msg、有的用 message，两者都读。
             let msg = answer
                 .body
                 .get("msg")
+                .or_else(|| answer.body.get("message"))
                 .and_then(|m| m.as_str())
                 .unwrap_or("Unknown error")
                 .to_string();
-            Err(NcmError::from_api(status, msg))
+            if api_code < 0 {
+                // 负数码是风控/拦截，而不是参数错误。
+                Err(NcmError::RateLimited(msg))
+            } else {
+                Err(NcmError::from_api(status, msg))
+            }
         }
     }
 }
