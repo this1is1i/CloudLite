@@ -6,8 +6,10 @@
 - 根因：新版接口 `/eapi/song/enhance/player/url/v1` 返回 HTTP 200，但响应体是 `{"code":-460,"message":"检测到您的网络环境存在风险，请稍后再试"}`。平台侧风控（-460）被 SDK 折叠成 400，且 SDK 只读 `msg` 字段（该响应用的是 `message`），于是错误文本退化成 "Unknown error"。同一台机器上兼容接口 `/api/song/enhance/player/url` 一直正常返回可用地址。
 - 修复：`cloud.rs` 的 `song_url` 改为先用兼容接口（`id` + `br=999000`，按账号权限取最高码率），它返回空地址或请求失败时再试新版接口；兼容接口已返回「无音源」这类答案时，最终提示仍是「此歌曲暂无可播放音源，或超出账号权益」，不拿风控文案覆盖它。
 - 同步修正 SDK：错误信息同时读取 `msg` 与 `message`；负数业务码（风控/拦截）归入限流类错误，不再显示成「参数错误」。
-- 匿名实测（2026-11-19）：歌曲 1974443814、347230 经新的取址路径返回 `https://…music.126.net/…mp3`，试听标记 `preview=true`；无音源的 186016 返回「此歌曲暂无可播放音源，或超出账号权益」并附新版接口的风控说明。
-- 本次 `cargo test --offline --locked --tests` 23 项通过，`cargo fmt --check` 通过，Release 构建通过；可执行文件 3,608,576 字节。
+- 匿名实测（2026-11-19）：歌曲 1974443814、347230 经新的取址路径返回 `http://…music.126.net/…mp3`，试听标记 `preview=true`；无音源的 186016 返回「此歌曲暂无可播放音源，或超出账号权益」并附新版接口的风控说明。
+- 取到地址后仍播不出来，另一个原因出在地址本身：`playback_url` 过去会把 `http` 强升成 `https`，而 Windows MediaPlayer 对同一首歌曲的 `https` 形式会一直停在 0 ms，换回平台给的 `http` 地址立即推进。现在保留平台返回的协议，只校验它是 `http`/`https`。探针 `examples/probe_stream.rs` 的实测输出：`https play: stalled at 0 ms`、`http play: advanced to 154 ms`。
+- 修复后在全新数据目录跑 `cloudlite.exe --probe-api`：`public_playback_url_received=true`、`stream_playback_clock_advanced=true`（此前为 `false`）。
+- 本次 `cargo test --offline --locked --tests` 23 项通过，`cargo fmt --check` 通过，Release 构建通过；可执行文件 3,607,552 字节，SHA-256 `470afb64187f86448323f9409042775ac2b420f2bb00c91c9589ac767b4f7ac1`。
 - 此前「图标、扫描进度与网络重试」一节记录的 `--probe-api` 项 `public_playback_url_received=true` 不可信：同一取址路径在当时会返回 -460，该项应视为历史记录。
 - 真实登录账号下的会员/无损曲目取址尚未人工复测。
 

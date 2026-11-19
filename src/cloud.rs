@@ -99,15 +99,13 @@ pub fn playback_url(body: &Value) -> anyhow::Result<(String, bool)> {
         .as_str()
         .filter(|s| !s.is_empty())
         .context("此歌曲暂无可播放音源，或超出账号权益")?;
-    let mut url = url::Url::parse(value)?;
+    let url = url::Url::parse(value)?;
     ensure!(
         ["http", "https"].contains(&url.scheme()),
         "平台返回了非网络播放地址"
     );
-    if url.scheme() == "http" {
-        url.set_scheme("https")
-            .map_err(|_| anyhow::anyhow!("无效的音源地址"))?;
-    }
+    // Keep the scheme the platform handed out: MediaPlayer stalls at 0 ms on the
+    // https form of an http media URL, while the address itself plays fine.
     Ok((url.to_string(), !item["freeTrialInfo"].is_null()))
 }
 

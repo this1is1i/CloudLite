@@ -49,8 +49,11 @@ fn a_large_playlist_uses_all_track_ids_and_preserves_remote_order() {
 fn restricted_tracks_fail_explicitly_and_previews_are_identified() {
     assert!(playback_url(&json!({"data":[{"url":null,"code":-110}]})).is_err());
     let (url,preview)=playback_url(&json!({"data":[{"url":"http://m801.music.126.net/song.mp3","freeTrialInfo":{"start":0,"end":30}}]})).unwrap();
-    assert!(url.starts_with("https://"));
+    assert!(url.starts_with("http://m801.music.126.net/song.mp3"));
     assert!(preview);
+    let (secure, _) =
+        playback_url(&json!({"data":[{"url":"https://m801.music.126.net/song.mp3"}]})).unwrap();
+    assert!(secure.starts_with("https://"));
     assert!(playback_url(&json!({"data":[{"url":"file:///C:/secret"}]})).is_err());
     let _ = Track::default();
 }
