@@ -63,6 +63,10 @@ pub enum Event {
         tracks: Vec<Track>,
         warnings: Vec<String>,
     },
+    ScanProgress {
+        done: usize,
+        total: usize,
+    },
     Ready {
         epoch: u64,
         track: Track,
@@ -242,12 +246,53 @@ pub fn spawn(
                                     }),
                                 },
                                 Command::Scan(roots) => {
-                                    let (tracks, warnings) = cloudlite::library::scan(&roots);
-                                    cloudlite::persistence::save_json(
-                                        &data.join("library.json"),
-                                        &serde_json::to_value(&tracks)?,
-                                    )?;
-                                    emit(Event::Library { tracks, warnings });
+                                    let sender = events.clone();
+                                    let notify = wake.clone();
+                                    let library = data.join("library.json");
+                                    // Scanning runs off the API worker so QR polling and playback
+                                    // control stay responsive while tags are read.
+                                    std::thread::Builder::new()
+                                        .name("cloudlite-scan".into())
+                                        .spawn(move || {
+                                            let mut reported = Instant::now()
+                                                .checked_sub(Duration::from_secs(1))
+                                                .unwrap_or_else(Instant::now);
+                                            let (tracks, warnings) = cloudlite::library::scan_with(
+                                                &roots,
+                                                |done, total| {
+                                                    let finished = total > 0 && done >= total;
+                                                    if !finished
+                                                        && reported.elapsed()
+                                                            < Duration::from_millis(120)
+                                                    {
+                                                        return;
+                                                    }
+                                                    reported = Instant::now();
+                                                    if sender
+                                                        .send(Event::ScanProgress { done, total })
+                                                        .is_ok()
+                                                    {
+                                                        notify();
+                                                    }
+                                                },
+                                            );
+                                            let saved = serde_json::to_value(&tracks)
+                                                .map_err(anyhow::Error::from)
+                                                .and_then(|value| {
+                                                    cloudlite::persistence::save_json(
+                                                        &library, &value,
+                                                    )
+                                                });
+                                            let event = match saved {
+                                                Ok(()) => Event::Library { tracks, warnings },
+                                                Err(error) => {
+                                                    Event::Error(format!("保存曲库失败：{error:#}"))
+                                                }
+                                            };
+                                            if sender.send(event).is_ok() {
+                                                notify();
+                                            }
+                                        })?;
                                 }
                                 Command::Resolve {
                                     epoch,

@@ -117,6 +117,7 @@ struct App {
     now: Option<Track>,
     visible: bool,
     source_tokens: Option<(i64, i64, i64)>,
+    scanning: bool,
 }
 
 pub fn run(
@@ -131,7 +132,7 @@ pub fn run(
         anyhow::ensure!(
             InitCommonControlsEx(&INITCOMMONCONTROLSEX {
                 dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-                dwICC: ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES
+                dwICC: ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS
             })
             .as_bool(),
             "无法初始化系统控件"
@@ -139,7 +140,7 @@ pub fn run(
         let instance: HINSTANCE = GetModuleHandleW(None)?.into();
         let class = WNDCLASSW {
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hIcon: LoadIconW(None, IDI_APPLICATION)?,
+            hIcon: app_icon(GetSystemMetrics(SM_CXICON)),
             hInstance: instance,
             lpszClassName: w!("CloudLiteMain"),
             lpfnWndProc: Some(window_proc),
@@ -202,6 +203,7 @@ pub fn run(
             now: None,
             visible: true,
             source_tokens: None,
+            scanning: false,
         }));
         let app_ptr = app.as_mut() as *mut RefCell<App>;
         let hwnd = CreateWindowExW(
@@ -286,6 +288,25 @@ pub fn run(
         RoUninitialize();
     }
     Ok(())
+}
+
+/// Loads the multi-size icon embedded by build.rs (resource id 1). An empty handle means
+/// the build did not find rc.exe, in which case callers fall back to the drawn brand icon.
+unsafe fn app_icon(size: i32) -> HICON {
+    let instance: HINSTANCE = match GetModuleHandleW(None) {
+        Ok(module) => module.into(),
+        Err(_) => return HICON::default(),
+    };
+    LoadImageW(
+        Some(instance),
+        PCWSTR(1 as *const u16),
+        IMAGE_ICON,
+        size,
+        size,
+        LR_DEFAULTCOLOR,
+    )
+    .map(|handle| HICON(handle.0))
+    .unwrap_or_default()
 }
 
 pub fn pick_folder_helper(owner: usize) -> anyhow::Result<Option<PathBuf>> {
@@ -475,18 +496,23 @@ impl App {
     unsafe fn initialize(&mut self) -> anyhow::Result<()> {
         self.reset_fonts();
         self.add("brand", w!("STATIC"), "云简", SS_OWNERDRAW.0 as u32, 0)?;
-        SendMessageW(
-            self.hwnd,
-            WM_SETICON,
-            Some(WPARAM(ICON_SMALL as usize)),
-            Some(LPARAM(self.theme.icon.0 as isize)),
-        );
-        SendMessageW(
-            self.hwnd,
-            WM_SETICON,
-            Some(WPARAM(ICON_BIG as usize)),
-            Some(LPARAM(self.theme.icon.0 as isize)),
-        );
+        for (kind, size) in [
+            (ICON_SMALL, GetSystemMetrics(SM_CXSMICON)),
+            (ICON_BIG, GetSystemMetrics(SM_CXICON)),
+        ] {
+            let icon = app_icon(size);
+            let icon = if icon.0.is_null() {
+                self.theme.icon
+            } else {
+                icon
+            };
+            SendMessageW(
+                self.hwnd,
+                WM_SETICON,
+                Some(WPARAM(kind as usize)),
+                Some(LPARAM(icon.0 as isize)),
+            );
+        }
         SendMessageW(
             self.control("brand"),
             WM_SETFONT,
@@ -680,6 +706,8 @@ impl App {
             0,
         )?;
         self.add("exit", w!("BUTTON"), "退出", WS_TABSTOP.0, ID_EXIT)?;
+        let progress = self.add("progress", PROGRESS_CLASSW, "", PBS_SMOOTH as u32, 0)?;
+        let _ = ShowWindow(progress, SW_HIDE);
         // Apply fonts to the completed control set, including the section heading.
         self.reset_fonts();
         let hwnd = self.hwnd.0 as usize;
@@ -748,6 +776,7 @@ impl App {
         set("hint", x, p(142), body - p(112), p(24));
         set("more", right - p(100), p(136), p(100), p(30));
         set("list", x, p(178), body, h - p(354));
+        set("progress", x, h - p(172), body, p(6));
         set("now", x, h - p(156), body, p(28));
         set("prev", x, h - p(114), p(78), p(34));
         set("play", x + p(88), h - p(114), p(78), p(34));
@@ -826,7 +855,16 @@ impl App {
         );
         self.update_list();
     }
-    fn scan(&self) {
+    unsafe fn scan(&mut self) {
+        if self.scanning {
+            self.status("正在扫描本地音乐，请稍候。");
+            return;
+        }
+        self.scanning = true;
+        let bar = self.control("progress");
+        let _ = SendMessageW(bar, PBM_SETRANGE32, Some(WPARAM(0)), Some(LPARAM(100)));
+        let _ = SendMessageW(bar, PBM_SETPOS, Some(WPARAM(0)), Some(LPARAM(0)));
+        let _ = ShowWindow(bar, SW_SHOW);
         self.status("正在扫描本地音乐… 原始文件保持不变。");
         self.send(Command::Scan(self.settings.folders.clone()));
     }
@@ -1327,7 +1365,24 @@ impl App {
                     self.update_list();
                     self.status("加载完成 · 双击歌曲播放。");
                 }
+                Event::ScanProgress { done, total } => {
+                    if total == 0 {
+                        self.status(&format!("正在查找音乐文件… 已发现 {done} 首"));
+                        continue;
+                    }
+                    let bar = self.control("progress");
+                    let _ = SendMessageW(
+                        bar,
+                        PBM_SETRANGE32,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(total as isize)),
+                    );
+                    let _ = SendMessageW(bar, PBM_SETPOS, Some(WPARAM(done)), Some(LPARAM(0)));
+                    self.status(&format!("正在读取音乐信息… {done}/{total}"));
+                }
                 Event::Library { tracks, warnings } => {
+                    self.scanning = false;
+                    let _ = ShowWindow(self.control("progress"), SW_HIDE);
                     self.local = tracks;
                     if self.local_view {
                         self.show_local();

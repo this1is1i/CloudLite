@@ -8,6 +8,48 @@ use std::{
     time::Duration,
 };
 
+/// Retries transport-level failures only: flaky DNS lookups, TLS handshakes and dropped
+/// connections are common, while an API answer the user must see is returned immediately.
+macro_rules! send {
+    ($label:expr, $call:expr) => {{
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let outcome: anyhow::Result<ApiResponse> = async { anyhow::Ok($call.await??) }.await;
+            match outcome {
+                Ok(response) => break anyhow::Ok(response),
+                Err(error) if attempt < 3 && retryable(&error) => {
+                    tokio::time::sleep(Duration::from_millis(250 * u64::from(attempt))).await;
+                }
+                Err(error) => break Err(error).context(format!("{}失败", $label)),
+            }
+        }
+    }};
+}
+
+fn retryable(error: &anyhow::Error) -> bool {
+    if error.chain().any(|cause| cause.is::<std::io::Error>()) {
+        return true;
+    }
+    let text = format!("{error:#}").to_ascii_lowercase();
+    [
+        "error sending request",
+        "timed out",
+        "elapsed",
+        "connect",
+        "dns",
+        "tls",
+        "ssl",
+        "reset",
+        "broken pipe",
+        "unexpected eof",
+        "os error",
+        "network",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 pub fn merge_cookies(current: &mut BTreeMap<String, String>, set_cookies: &[String]) {
     for raw in set_cookies {
         if let Some((key, value)) = raw.split(';').next().unwrap_or("").split_once('=') {
@@ -147,11 +189,13 @@ impl CloudClient {
         crate::persistence::save_bytes(&self.session, &crate::credentials::protect(b"{}")?)
     }
     pub async fn account(&mut self) -> anyhow::Result<Option<(u64, String)>> {
-        let response = tokio::time::timeout(
-            Duration::from_secs(18),
-            self.client.user_account(&Query::new()),
-        )
-        .await??;
+        let response = send!(
+            "读取账号",
+            tokio::time::timeout(
+                Duration::from_secs(18),
+                self.client.user_account(&Query::new()),
+            )
+        )?;
         let body = self.accept(response)?;
         let profile = body.get("profile").or_else(|| body["data"].get("profile"));
         if let Some(profile) = profile {
@@ -167,11 +211,13 @@ impl CloudClient {
         Ok(None)
     }
     pub async fn qr_key(&mut self) -> anyhow::Result<String> {
-        let response = tokio::time::timeout(
-            Duration::from_secs(18),
-            self.client.login_qr_key(&Query::new()),
-        )
-        .await??;
+        let response = send!(
+            "获取登录二维码",
+            tokio::time::timeout(
+                Duration::from_secs(18),
+                self.client.login_qr_key(&Query::new()),
+            )
+        )?;
         let body = self.accept(response)?;
         body["unikey"]
             .as_str()
@@ -180,11 +226,13 @@ impl CloudClient {
             .context("平台未返回登录二维码")
     }
     pub async fn qr_check(&mut self, key: &str) -> anyhow::Result<u64> {
-        let response = tokio::time::timeout(
-            Duration::from_secs(12),
-            self.client.login_qr_check(&Query::new().param("key", key)),
-        )
-        .await??;
+        let response = send!(
+            "检查扫码状态",
+            tokio::time::timeout(
+                Duration::from_secs(12),
+                self.client.login_qr_check(&Query::new().param("key", key)),
+            )
+        )?;
         let body = self.accept(response)?;
         Ok(body["code"].as_u64().unwrap_or(800))
     }
@@ -198,9 +246,10 @@ impl CloudClient {
             .param("type", "1")
             .param("limit", "100")
             .param("offset", &offset.to_string());
-        let response =
+        let response = send!(
+            "搜索歌曲",
             tokio::time::timeout(Duration::from_secs(18), self.client.cloudsearch(&query))
-                .await??;
+        )?;
         let body = self.accept(response)?;
         ensure!(
             body["result"]["songs"].is_array() || body["result"]["songCount"].as_u64() == Some(0),
@@ -219,9 +268,10 @@ impl CloudClient {
                 .param("uid", &user.to_string())
                 .param("limit", "200")
                 .param("offset", &offset.to_string());
-            let response =
+            let response = send!(
+                "读取歌单",
                 tokio::time::timeout(Duration::from_secs(18), self.client.user_playlist(&query))
-                    .await??;
+            )?;
             let body = self.accept(response)?;
             let list = body["playlist"].as_array().context("平台未返回歌单列表")?;
             all.extend(list.iter().filter_map(|p| {
@@ -240,12 +290,14 @@ impl CloudClient {
         Ok(all)
     }
     pub async fn playlist(&mut self, id: u64) -> anyhow::Result<Vec<Track>> {
-        let response = tokio::time::timeout(
-            Duration::from_secs(18),
-            self.client
-                .playlist_detail(&Query::new().param("id", &id.to_string()).param("s", "0")),
-        )
-        .await??;
+        let response = send!(
+            "读取歌单详情",
+            tokio::time::timeout(
+                Duration::from_secs(18),
+                self.client
+                    .playlist_detail(&Query::new().param("id", &id.to_string()).param("s", "0")),
+            )
+        )?;
         let body = self.accept(response)?;
         let ids = playlist_ids(&body)?;
         let mut tracks = Vec::with_capacity(ids.len());
@@ -259,9 +311,10 @@ impl CloudClient {
                     .collect::<Vec<_>>()
                     .join(","),
             );
-            let response =
+            let response = send!(
+                "读取歌曲信息",
                 tokio::time::timeout(Duration::from_secs(18), self.client.song_detail(&query))
-                    .await??;
+            )?;
             let body = self.accept(response)?;
             tracks.extend(crate::model::parse_tracks(&body["songs"]));
         }
@@ -278,9 +331,10 @@ impl CloudClient {
         let query = Query::new()
             .param("id", &id.to_string())
             .param("level", "exhigh");
-        let response =
+        let response = send!(
+            "获取播放地址",
             tokio::time::timeout(Duration::from_secs(18), self.client.song_url_v1(&query))
-                .await??;
+        )?;
         let body = self.accept(response)?;
         playback_url(&body)
     }
